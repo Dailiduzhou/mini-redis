@@ -2,7 +2,7 @@ use crate::frame::{self, Frame};
 
 use bytes::{Buf, BytesMut};
 use std::io::{self, Cursor};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
 
 /// Send and receive `Frame` values from a remote peer.
@@ -154,25 +154,7 @@ impl Connection {
     /// write stream. The data will be written to the buffer. Once the buffer is
     /// full, it is flushed to the underlying socket.
     pub async fn write_frame(&mut self, frame: &Frame) -> io::Result<()> {
-        // Arrays are encoded by encoding each entry. All other frame types are
-        // considered literals. For now, mini-redis is not able to encode
-        // recursive frame structures. See below for more details.
-        match frame {
-            Frame::Array(val) => {
-                // Encode the frame type prefix. For an array, it is `*`.
-                self.stream.write_u8(b'*').await?;
-
-                // Encode the length of the array.
-                self.write_decimal(val.len() as u64).await?;
-
-                // Iterate and encode each entry in the array.
-                for entry in &**val {
-                    self.write_value(entry).await?;
-                }
-            }
-            // The frame type is a literal. Encode the value directly.
-            _ => self.write_value(frame).await?,
-        }
+        self.write_value(frame).await?;
 
         // Ensure the encoded frame is written to the socket. The calls above
         // are to the buffered stream and writes. Calling `flush` writes the
@@ -180,39 +162,51 @@ impl Connection {
         self.stream.flush().await
     }
 
-    /// Write a frame literal to the stream
+    /// Write a frame to the stream.
     async fn write_value(&mut self, frame: &Frame) -> io::Result<()> {
-        match frame {
-            Frame::Simple(val) => {
-                self.stream.write_u8(b'+').await?;
-                self.stream.write_all(val.as_bytes()).await?;
-                self.stream.write_all(b"\r\n").await?;
-            }
-            Frame::Error(val) => {
-                self.stream.write_u8(b'-').await?;
-                self.stream.write_all(val.as_bytes()).await?;
-                self.stream.write_all(b"\r\n").await?;
-            }
-            Frame::Integer(val) => {
-                self.stream.write_u8(b':').await?;
-                self.write_decimal(*val).await?;
-            }
-            Frame::Null => {
-                self.stream.write_all(b"$-1\r\n").await?;
-            }
-            Frame::Bulk(val) => {
-                let len = val.len();
+        Self::write_value_to(&mut self.stream, frame).await
+    }
 
-                self.stream.write_u8(b'$').await?;
-                self.write_decimal(len as u64).await?;
-                self.stream.write_all(val).await?;
-                self.stream.write_all(b"\r\n").await?;
+    async fn write_value_to<W>(stream: &mut W, frame: &Frame) -> io::Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let mut stack = vec![frame];
+
+        while let Some(frame) = stack.pop() {
+            match frame {
+                Frame::Simple(val) => {
+                    stream.write_u8(b'+').await?;
+                    stream.write_all(val.as_bytes()).await?;
+                    stream.write_all(b"\r\n").await?;
+                }
+                Frame::Error(val) => {
+                    stream.write_u8(b'-').await?;
+                    stream.write_all(val.as_bytes()).await?;
+                    stream.write_all(b"\r\n").await?;
+                }
+                Frame::Integer(val) => {
+                    stream.write_u8(b':').await?;
+                    Self::write_decimal_to(stream, *val).await?;
+                }
+                Frame::Null => {
+                    stream.write_all(b"$-1\r\n").await?;
+                }
+                Frame::Bulk(val) => {
+                    stream.write_u8(b'$').await?;
+                    Self::write_decimal_to(stream, val.len() as u64).await?;
+                    stream.write_all(val).await?;
+                    stream.write_all(b"\r\n").await?;
+                }
+                Frame::Array(values) => {
+                    stream.write_u8(b'*').await?;
+                    Self::write_decimal_to(stream, values.len() as u64).await?;
+
+                    for value in values.iter().rev() {
+                        stack.push(value);
+                    }
+                }
             }
-            // Encoding an `Array` from within a value cannot be done using a
-            // recursive strategy. In general, async fns do not support
-            // recursion. Mini-redis has not needed to encode nested arrays yet,
-            // so for now it is skipped.
-            Frame::Array(_val) => unreachable!(),
         }
 
         Ok(())
@@ -220,6 +214,13 @@ impl Connection {
 
     /// Write a decimal frame to the stream
     async fn write_decimal(&mut self, val: u64) -> io::Result<()> {
+        Self::write_decimal_to(&mut self.stream, val).await
+    }
+
+    async fn write_decimal_to<W>(stream: &mut W, val: u64) -> io::Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
         use std::io::Write;
 
         // Convert the value to a string
@@ -228,9 +229,60 @@ impl Connection {
         write!(&mut buf, "{val}")?;
 
         let pos = buf.position() as usize;
-        self.stream.write_all(&buf.get_ref()[..pos]).await?;
-        self.stream.write_all(b"\r\n").await?;
+        stream.write_all(&buf.get_ref()[..pos]).await?;
+        stream.write_all(b"\r\n").await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use tokio::io::{duplex, AsyncReadExt};
+
+    #[tokio::test]
+    async fn writes_empty_array_frame() {
+        let frame = Frame::Array(vec![]);
+
+        assert_encoded(frame, b"*0\r\n").await;
+    }
+
+    #[tokio::test]
+    async fn writes_flat_array_frame() {
+        let frame = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"SET")),
+            Frame::Bulk(Bytes::from_static(b"hello")),
+            Frame::Bulk(Bytes::from_static(b"world")),
+        ]);
+
+        assert_encoded(frame, b"*3\r\n$3\r\nSET\r\n$5\r\nhello\r\n$5\r\nworld\r\n").await;
+    }
+
+    #[tokio::test]
+    async fn writes_nested_array_frame() {
+        let frame = Frame::Array(vec![
+            Frame::Simple("outer".into()),
+            Frame::Array(vec![Frame::Integer(1), Frame::Null]),
+            Frame::Bulk(Bytes::from_static(b"tail")),
+        ]);
+
+        assert_encoded(frame, b"*3\r\n+outer\r\n*2\r\n:1\r\n$-1\r\n$4\r\ntail\r\n").await;
+    }
+
+    async fn assert_encoded(frame: Frame, expected: &[u8]) {
+        let (stream, mut peer) = duplex(64);
+        let mut writer = BufWriter::new(stream);
+
+        Connection::write_value_to(&mut writer, &frame)
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        let mut actual = vec![0; expected.len()];
+        peer.read_exact(&mut actual).await.unwrap();
+
+        assert_eq!(actual, expected);
     }
 }
