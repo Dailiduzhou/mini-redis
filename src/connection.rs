@@ -192,6 +192,9 @@ impl Connection {
                 Frame::Null => {
                     stream.write_all(b"$-1\r\n").await?;
                 }
+                Frame::NullArray => {
+                    stream.write_all(b"*-1\r\n").await?;
+                }
                 Frame::Bulk(val) => {
                     stream.write_u8(b'$').await?;
                     Self::write_decimal_to(stream, val.len() as u64).await?;
@@ -269,6 +272,18 @@ mod tests {
         ]);
 
         assert_encoded(frame, b"*3\r\n+outer\r\n*2\r\n:1\r\n$-1\r\n$4\r\ntail\r\n").await;
+    }
+
+    #[tokio::test]
+    async fn writes_null_array_frame() {
+        assert_encoded(Frame::NullArray, b"*-1\r\n").await;
+    }
+
+    #[tokio::test]
+    async fn writes_nested_null_array_frame() {
+        let frame = Frame::Array(vec![Frame::NullArray, Frame::Integer(1)]);
+
+        assert_encoded(frame, b"*2\r\n*-1\r\n:1\r\n").await;
     }
 
     async fn assert_encoded(frame: Frame, expected: &[u8]) {

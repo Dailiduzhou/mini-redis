@@ -16,6 +16,7 @@ pub enum Frame {
     Integer(u64),
     Bulk(Bytes),
     Null,
+    NullArray,
     Array(Vec<Frame>),
 }
 
@@ -83,30 +84,26 @@ impl Frame {
                 // Format: $<length>\r\n<data>\r\n
                 //
                 // Special case: $-1\r\n represents a Null value.
-                // Validates that the frame conforms to RESP protocol.
-                if b'-' == peek_u8(src)? {
-                    let line = get_line(src)?;
-                    if line != b"-1" {
-                        return Err("protocol error; invalid frame format".into());
+                match get_length(src)? {
+                    Some(len) => {
+                        let len: usize = len.try_into()?;
+
+                        // skip that number of bytes + 2 (\r\n).
+                        skip(src, len + 2)
                     }
+                    None => Ok(()),
+                }
+            }
+            b'*' => match get_length(src)? {
+                Some(len) => {
+                    for _ in 0..len {
+                        Frame::check(src)?;
+                    }
+
                     Ok(())
-                } else {
-                    // Read the bulk string
-                    let len: usize = get_decimal(src)?.try_into()?;
-
-                    // skip that number of bytes + 2 (\r\n).
-                    skip(src, len + 2)
                 }
-            }
-            b'*' => {
-                let len = get_decimal(src)?;
-
-                for _ in 0..len {
-                    Frame::check(src)?;
-                }
-
-                Ok(())
-            }
+                None => Ok(()),
+            },
             actual => Err(format!("protocol error; invalid frame type byte `{actual}`").into()),
         }
     }
@@ -137,41 +134,39 @@ impl Frame {
                 Ok(Frame::Integer(len))
             }
             b'$' => {
-                if b'-' == peek_u8(src)? {
-                    let line = get_line(src)?;
+                match get_length(src)? {
+                    None => Ok(Frame::Null),
+                    Some(len) => {
+                        // Read the bulk string
+                        let len = len.try_into()?;
+                        let n = len + 2;
 
-                    if line != b"-1" {
-                        return Err("protocol error; invalid frame format".into());
+                        if src.remaining() < n {
+                            return Err(Error::Incomplete);
+                        }
+
+                        let data = Bytes::copy_from_slice(&src.chunk()[..len]);
+
+                        // skip that number of bytes + 2 (\r\n).
+                        skip(src, n)?;
+
+                        Ok(Frame::Bulk(data))
                     }
-
-                    Ok(Frame::Null)
-                } else {
-                    // Read the bulk string
-                    let len = get_decimal(src)?.try_into()?;
-                    let n = len + 2;
-
-                    if src.remaining() < n {
-                        return Err(Error::Incomplete);
-                    }
-
-                    let data = Bytes::copy_from_slice(&src.chunk()[..len]);
-
-                    // skip that number of bytes + 2 (\r\n).
-                    skip(src, n)?;
-
-                    Ok(Frame::Bulk(data))
                 }
             }
-            b'*' => {
-                let len = get_decimal(src)?.try_into()?;
-                let mut out = Vec::with_capacity(len);
+            b'*' => match get_length(src)? {
+                None => Ok(Frame::NullArray),
+                Some(len) => {
+                    let len = len.try_into()?;
+                    let mut out = Vec::with_capacity(len);
 
-                for _ in 0..len {
-                    out.push(Frame::parse(src)?);
+                    for _ in 0..len {
+                        out.push(Frame::parse(src)?);
+                    }
+
+                    Ok(Frame::Array(out))
                 }
-
-                Ok(Frame::Array(out))
-            }
+            },
             _ => unimplemented!(),
         }
     }
@@ -205,6 +200,7 @@ impl fmt::Display for Frame {
                 Err(_) => write!(fmt, "{msg:?}"),
             },
             Frame::Null => "(nil)".fmt(fmt),
+            Frame::NullArray => "(nil array)".fmt(fmt),
             Frame::Array(parts) => {
                 for (i, part) in parts.iter().enumerate() {
                     if i > 0 {
@@ -253,6 +249,21 @@ fn get_decimal(src: &mut Cursor<&[u8]>) -> Result<u64, Error> {
     let line = get_line(src)?;
 
     atoi::<u64>(line).ok_or_else(|| "protocol error; invalid frame format".into())
+}
+
+/// Read an array or bulk length, allowing `-1` for null values.
+fn get_length(src: &mut Cursor<&[u8]>) -> Result<Option<u64>, Error> {
+    use atoi::atoi;
+
+    let line = get_line(src)?;
+
+    if line == b"-1" {
+        Ok(None)
+    } else {
+        atoi::<u64>(line)
+            .map(Some)
+            .ok_or_else(|| "protocol error; invalid frame format".into())
+    }
 }
 
 /// Find a line
@@ -307,5 +318,51 @@ impl fmt::Display for Error {
             Error::Incomplete => "stream ended early".fmt(fmt),
             Error::Other(err) => err.fmt(fmt),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_accepts_null_array() {
+        let mut src = Cursor::new(&b"*-1\r\n"[..]);
+
+        Frame::check(&mut src).unwrap();
+        assert_eq!(src.position(), 5);
+    }
+
+    #[test]
+    fn parse_null_array() {
+        let mut src = Cursor::new(&b"*-1\r\n"[..]);
+
+        let frame = Frame::parse(&mut src).unwrap();
+
+        assert!(matches!(frame, Frame::NullArray));
+    }
+
+    #[test]
+    fn parse_nested_null_array() {
+        let mut src = Cursor::new(&b"*2\r\n*-1\r\n:1\r\n"[..]);
+
+        let frame = Frame::parse(&mut src).unwrap();
+
+        match frame {
+            Frame::Array(parts) => {
+                assert!(matches!(parts[0], Frame::NullArray));
+                assert!(matches!(parts[1], Frame::Integer(1)));
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reject_invalid_negative_array_length() {
+        let mut src = Cursor::new(&b"*-2\r\n"[..]);
+
+        assert!(Frame::check(&mut src).is_err());
+        src.set_position(0);
+        assert!(Frame::parse(&mut src).is_err());
     }
 }
